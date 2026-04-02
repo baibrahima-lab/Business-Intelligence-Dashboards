@@ -1,1 +1,259 @@
+<div align="center"> 
+  <h1>Système d'Information Décisionnel · Bankia</h1>
+  <p>De la donnée brute au rapport Power BI en production — sur Azure & Microsoft Fabric</p>
+</div>
 
+---
+
+## 🎯 Ce projet en une phrase
+Concevoir et déployer un **SID complet** pour Bankia, une banque fictive opérant en Tunisie et en France — de l'ingestion de fichiers CSV/Excel jusqu'à un rapport Power BI publié sur Microsoft Fabric, en passant par un Data Lake, un ODS et un Data Warehouse en schéma étoile.
+
+## 🔄 Le pipeline en un coup d'œil
+
+```text
+ 📁 Fichiers bruts          ☁️ Azure Cloud                    📊 Fabric 
+─────────────────    ──────────────────────────────    ────────────────── 
+                      │                              │  
+  Clients.csv    ───▶ │  ADLS Gen2    Azure SQL DB   │ ───▶  Lakehouse  
+  Bankia.xlsx    ───▶ │  (Bronze)  ──▶ ODS ──▶ DWH  │ ───▶  Power BI      
+                      │        ADF orchestre tout     │       5 pages      
+                      │                              │                      
+                      └──────────────────────────────┘
+```
+
+> **Note :** Chaque nuit à 02h00, Azure Data Factory déclenche automatiquement les pipelines, nettoie les données, alimente le Data Warehouse, et Power BI affiche des chiffres frais le matin.
+
+## 📊 Les chiffres du projet
+
+<table> 
+  <tr> 
+    <td align="center"><b>490 201 €</b><br/><sub>Volume transactionnel</sub></td> 
+    <td align="center"><b>200</b><br/><sub>Transactions analysées</sub></td> 
+    <td align="center"><b>50</b><br/><sub>Clients actifs</sub></td> 
+    <td align="center"><b>6</b><br/><sub>Agences (TN + FR)</sub></td> 
+    <td align="center"><b>5</b><br/><sub>Pages Power BI</sub></td> 
+    <td align="center"><b>35+</b><br/><sub>Mesures DAX</sub></td> 
+  </tr> 
+</table>
+
+## 🏗️ Architecture détaillée
+
+### Les 3 couches de données
+
+| Couche | Service Azure | Contenu | Rôle |
+|:---:|---|---|---|
+| 🟤 **Bronze** | ADLS Gen2 | Fichiers bruts CSV / XLSX | Stockage tel quel, aucune transformation |
+| ⚪ **Silver** | Azure SQL | Schéma `ods` | 5 tables nettoyées (Déduplication, typage, standardisation) |
+| 🟡 **Gold** | Azure SQL | Schéma `dwh` | Schéma en étoile prêt pour le reporting Power BI |
+
+### Le schéma en étoile
+
+```text
+                     ┌─────────────┐                     
+                     │  DIM_DATE   │                     
+                     └──────┬──────┘                            
+                            │
+┌─────────────┐    ┌────────┴────────┐    ┌─────────────┐
+│ DIM_CLIENT  │────│                 │────│  DIM_AGENCE │
+└─────────────┘    │ FACT_           │    └──────┬──────┘
+┌─────────────┐    │ TRANSACTIONS    │           │
+│ DIM_PRODUIT │────│  (200 lignes)   │    ┌──────┴──────┐
+└─────────────┘    │                 │    │ FACT_       │
+┌─────────────┐    └─────────────────┘    │ DEPENSES    │
+│ DIM_TYPE    │                           │  (50 lignes)│
+└─────────────┘                           └─────────────┘
+```
+
+### Les 3 pipelines ADF
+
+#### `PL_ODS_Master` — Ingestion des sources
+Lit les fichiers dans le Data Lake et les copie dans les tables ODS, dans l'ordre :
+* `Clients.csv` ──▶ `ods.CLIENTS`
+* `Agences` ──▶ `ods.AGENCES`
+* `Produits` ──▶ `ods.PRODUITS_BANCAIRES`
+* `Transactions` ──▶ `ods.TRANSACTIONS`
+* `Dépenses` ──▶ `ods.DEPENSES`
+
+*Méthode d'écriture : **Upsert** sur la clé primaire — pas de doublons, même en cas de rechargement.*
+
+#### `PL_DWH_Master` — Alimentation du star schema
+Appelle les procédures stockées SQL dans l'ordre obligatoire :
+1. `sp_Load_DIM_DATE` ← génère 3 653 jours (2020 → 2030)
+2. `sp_Load_DIM_CLIENT` ← MERGE ods → dwh
+3. `sp_Load_DIM_AGENCE` ← MERGE ods → dwh
+4. `sp_Load_DIM_PRODUIT` ← MERGE ods → dwh
+5. `sp_Load_DIM_TYPE_TRANSACTION` ← 4 types statiques
+6. `sp_Load_FACT_TRANSACTIONS` ← INSERT WHERE NOT EXISTS
+7. `sp_Load_FACT_DEPENSES` ← INSERT WHERE NOT EXISTS
+
+> ⚠️ **Important :** Les dimensions **avant** les faits — toujours. Les clés étrangères de FACT pointent vers les DIM : charger dans le mauvais ordre provoque une erreur de contrainte SQL.
+
+#### `PL_Master` — Orchestrateur
+
+```text
+PL_Master  
+ └──▶ Exécuter PL_ODS_Master   (attendre la fin)         
+        └──▶ Exécuter PL_DWH_Master  (attendre la fin)
+```
+Planifié chaque nuit. En cas d'échec de l'ODS, le DWH ne s'exécute pas — les données restent cohérentes.
+
+## 📈 Rapport Power BI — 5 pages
+
+1. **Page 1 — Vue globale & KPIs :** Synthèse exécutive : 4 cartes KPI, évolution mensuelle du volume, répartition par type de transaction, indicateurs de performance clés.
+2. **Page 2 — Transactions & Produits :** Qui dépense quoi, comment ? Histogramme empilé par mois et type, classement des 6 produits, top 10 clients avec leur segment.
+3. **Page 3 — Agences & Géographie :** Carte interactive avec bulles proportionnelles au volume, comparaison Revenus vs Dépenses par agence, matrice croisée avec heatmap.
+4. **Page 4 — Finance & Rentabilité :** Waterfall chart des dépenses, graphique combiné revenus/dépenses/marge par agence, jauge du taux de marge vs objectif 30%.
+5. **Page 5 — Segmentation Clients RFM :** Scatter plot Fréquence vs Montant, matrice de segmentation dynamique Premium / Régulier / Occasionnel / Inactif.
+
+### Mesures DAX essentielles
+
+```dax
+-- Les fondamentaux
+Montant_Total      = SUM(FACT_TRANSACTIONS[Montant])
+Nb_Transactions    = COUNTROWS(FACT_TRANSACTIONS)
+Nb_Clients_Actifs  = DISTINCTCOUNT(FACT_TRANSACTIONS[ID_Client])
+
+-- Time Intelligence
+Montant_YTD        = TOTALYTD([Montant_Total], DIM_DATE[Date_Complet])
+Variation_YoY      = DIVIDE([Montant_Total] - [Montant_An_Precedent], [Montant_An_Precedent], 0)
+
+-- Finance
+Marge_Nette        = [Montant_Total] - SUM(FACT_DEPENSES[Montant_Depense])
+Taux_Marge         = DIVIDE([Marge_Nette], [Montant_Total], 0)
+
+-- Segmentation RFM dynamique
+Segment_Dynamique =    
+    VAR M = [Montant_Total]    
+    VAR F = [Nb_Transactions]    
+    RETURN        
+        IF(M >= 20000 && F >= 4, "Premium",        
+        IF(M >= 5000  && F >= 2, "Régulier",        
+        IF(F > 0, "Occasionnel", "Inactif")))
+```
+
+## 🏆 Résultats clés
+
+### Volume par type de transaction
+
+| Type | Montant | Opérations |
+|---|---|---|
+| Retrait | 138 554 € | 51 |
+| Virement | 129 856 € | 50 |
+| Paiement CB | 127 492 € | 54 |
+| Dépôt | 94 299 € | 45 |
+
+### Classement des agences (Revenus vs Dépenses)
+
+| Agence | Ville | Revenus | Dépenses | Résultat |
+|---|---|---|---|---|
+| Agence 3 | Sousse | 98 110 € | 74 205 € | ✅ +23 905 € |
+| Agence 2 | Sfax | 103 754 € | 107 558 € | ❌ -3 804 € |
+| Agence 4 | Marseille | 79 926 € | 85 635 € | ❌ -5 709 € |
+| Agence 5 | Paris | 115 527 € | 128 601 € | ❌ -13 074 € |
+| Agence 1 | Tunis | 92 884 € | 108 757 € | ❌ -15 873 € |
+
+> 💡 Seule l'Agence 3 (Sousse) est excédentaire. Le Marketing représente 39,6% des dépenses totales — premier axe d'optimisation identifié.
+
+## 📂 Structure du dépôt
+
+```text
+bankia-bi/
+│
+├── 📄 README.md
+│
+├── 📁 data/                          ← Sources brutes
+│   ├── Clients.csv
+│   └── Dataset_Bankia2025.xlsx
+│
+├── 📁 sql/                           ← Scripts SQL complets
+│   ├── 01_schemas.sql                ← CREATE SCHEMA ods, dwh
+│   ├── 02_ods_tables.sql             ← Tables ods.*
+│   ├── 03_dwh_dimensions.sql         ← Tables dwh.DIM_*
+│   ├── 04_dwh_facts.sql              ← Tables dwh.FACT_*
+│   ├── 05_stored_procedures.sql      ← Toutes les sp_Load_*
+│   └── 06_validation.sql             ← Vérification des counts
+│
+├── 📁 adf/                           ← Exports JSON des pipelines ADF
+│   ├── PL_ODS_Master.json
+│   ├── PL_DWH_Master.json
+│   └── PL_Master.json
+│
+├── 📁 powerbi/                       ← Rapport et mesures
+│   ├── Bankia_Report.pbix
+│   └── Mesures_DAX.dax
+│
+└── 📁 docs/                          ← Documentation
+    ├── Bankia_Projet_BI_Complet.pdf
+    └── StarSchema_Bankia.png
+```
+
+## 🚀 Démarrage rapide
+
+### 1 — Prérequis
+- Abonnement Azure actif
+- Power BI Desktop
+- SSMS ou Azure Data Studio
+- Accès Microsoft Fabric
+
+### 2 — Créer les ressources Azure
+
+```bash
+az group create --name rg-bankia-bi --location francecentral
+
+# Storage Account avec espace de noms hiérarchique (= ADLS Gen2)
+az storage account create \  
+  --name stbankiabi \  
+  --resource-group rg-bankia-bi \  
+  --hierarchical-namespace true \  
+  --sku Standard_LRS
+```
+
+### 3 — Initialiser la base de données
+
+```sql
+-- Dans Azure SQL Database "Bankia_DWH"
+CREATE SCHEMA ods;
+CREATE SCHEMA dwh;
+
+-- Puis exécuter les scripts sql/ dans l'ordre numéroté
+```
+
+### 4 — Configurer ADF
+1. **ADF Studio → Gérer → Services liés** → créer :
+   * `LS_ADLS_Bankia` (Azure Data Lake, auth identité managée)
+   * `LS_AzureSQL_Bankia` (Azure SQL, auth SQL)
+2. **ADF Studio → Auteur** → importer les pipelines depuis `adf/*.json`
+3. Publier tout → Déclencher maintenant (test)
+
+### 5 — Déployer sur Fabric
+1. `app.fabric.microsoft.com` → Nouveau workspace : `ws-bankia-bi`
+2. Nouveau Lakehouse : `lh_bankia_dwh`
+3. Pipeline de données : copier `dwh.*` → Lakehouse (format Delta)
+4. Nouveau modèle sémantique → créer les 7 relations
+
+### 6 — Publier le rapport
+1. **Power BI Desktop** → Obtenir les données → Microsoft Fabric → Semantic Models
+2. Ouvrir `Bankia_Report.pbix`
+3. Publier → `ws-bankia-bi`
+4. Configurer actualisation planifiée : quotidien 06h00
+
+### ✔️ Vérification en 30 secondes
+
+```sql
+SELECT 'FACT_TRANSACTIONS' AS [Table], COUNT(*) AS Lignes FROM dwh.FACT_TRANSACTIONS
+UNION ALL
+SELECT 'DIM_CLIENT', COUNT(*) FROM dwh.DIM_CLIENT
+UNION ALL
+SELECT 'DIM_AGENCE', COUNT(*) FROM dwh.DIM_AGENCE
+UNION ALL
+SELECT 'DIM_PRODUIT', COUNT(*) FROM dwh.DIM_PRODUIT
+UNION ALL
+SELECT 'FACT_DEPENSES', COUNT(*) FROM dwh.FACT_DEPENSES;
+
+
+<br/>
+
+<div align="center">
+  <sub>Projet BI 2025 – 2026 · Data Engineering & Data Analytics</sub><br/>
+  <sub><i>Données fictives — cadre académique</i></sub>
+</div>
